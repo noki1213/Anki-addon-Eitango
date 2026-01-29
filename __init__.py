@@ -105,19 +105,52 @@ def on_show_answer(card):
         
         examples = []
         for nid in found_nids:
+            # 自分自身は除外 (内部IDで比較するのが確実)
+            if nid == note.id:
+                continue
+
             other_note = mw.col.get_note(nid)
             
-            # 自分自身は除外
+            # IDフィールドによる重複チェック(念のため)
             if other_note['ID'] == current_id:
                 continue
-                
+
             raw_sentence = other_note['Sentence']
             if not raw_sentence:
                 continue
                 
             # 穴埋めタグの除去
             clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
-            examples.append(clean_sentence)
+            
+            # -------------------------------------------------
+            # Ankiのシステムデータから情報を取得
+            # -------------------------------------------------
+            
+            # 1. 作成日時 (note.id は作成時のミリ秒タイムスタンプ)
+            created_ts = other_note.id / 1000
+            dt = datetime.fromtimestamp(created_ts)
+            date_str = dt.strftime("%Y/%m/%d") # シンプルに日付だけにする（時刻は煩雑かも）
+            
+            # 2. 学習回数 (カード情報から取得)
+            # ノートに紐づくカードを全て取得 (通常は1つだが、Clozeは複数ありうる)
+            cards = other_note.cards()
+            total_reps = 0
+            if cards:
+                # 例文として表示しているノートの総学習回数（カードごとの合計）
+                for c in cards:
+                    total_reps += c.reps
+
+            # 表示用文字列
+            info_str = f" <span style='font-size: 0.8em; color: gray;'>({date_str}, {total_reps} reps)</span>"
+            
+            # 重複排除: 文章だけで判断するか、情報込みで判断するか
+            # ここでは「文章自体」が同じなら表示しないようにする（シンプル化）
+            # もし日付違いの同文を表示したい場合は full_text でチェックする
+            full_text = clean_sentence + info_str
+            
+            # 既存のリストに同じ内容が含まれていないか確認
+            if not any(clean_sentence in ex for ex in examples):
+                examples.append(full_text)
         
         if examples:
             # HTMLリストを作成
@@ -142,45 +175,6 @@ def on_show_answer(card):
 
     except Exception as e:
         print(f"Error in Eitango addon: {str(e)}")
-
-    for nid in found_nids:
-        other_note = mw.col.get_note(nid)
-        
-        # 自分自身は除外
-        if other_note['ID'] == current_id:
-            continue
-            
-        raw_sentence = other_note['Sentence']
-        if not raw_sentence:
-            continue
-            
-        # 穴埋めタグの除去: {{c1::答え::ヒント}} -> 答え
-        # 簡易的な正規表現
-        clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
-        examples.append(clean_sentence)
-    
-    if examples:
-        # HTMLリストを作成
-        list_html = "<strong>Other Examples:</strong><ul>"
-        for ex in examples:
-            list_html += f"<li>{ex}</li>"
-        list_html += "</ul>"
-        
-        # エスケープ処理 (JavaScriptの文字列として安全にする)
-        list_html_js = list_html.replace("'", "\\'").replace("\n", "")
-        
-        # JavaScriptを実行してDOMを書き換え
-        js = f"""
-        var div = document.getElementById('other-examples');
-        if (div) {{
-            div.innerHTML = '{list_html_js}';
-        }}
-        """
-        mw.reviewer.web.eval(js)
-    else:
-        # 例文がない場合
-        js = "var div = document.getElementById('other-examples'); if(div) { div.innerHTML = 'No other examples found.'; }"
-        mw.reviewer.web.eval(js)
 
 # -------------------------------------------------------------------------
 # 初期化処理
