@@ -98,14 +98,51 @@ def on_show_answer(card):
     if not word:
         return
 
-    # Search for other notes with the same word
-    # note:Eitango "Word:xxxxx"
-    # Escaping: if there's a double quote we'd need to handle it, e.g. by wrapping in single quotes, but
-    # Handled in a simplified way here
-    query = f'"note:{MODEL_NAME}" "Word:{word}"'
-    found_nids = mw.col.find_notes(query)
-    
-    examples = []
+    try:
+        # Search for other notes with the same word
+        query = f'"note:{MODEL_NAME}" "Word:{word}"'
+        found_nids = mw.col.find_notes(query)
+        
+        examples = []
+        for nid in found_nids:
+            other_note = mw.col.get_note(nid)
+            
+            # Exclude itself
+            if other_note['ID'] == current_id:
+                continue
+                
+            raw_sentence = other_note['Sentence']
+            if not raw_sentence:
+                continue
+                
+            # Strip the cloze-deletion tags
+            clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+            examples.append(clean_sentence)
+        
+        if examples:
+            # Build the HTML list
+            list_html = "<strong>Other Examples:</strong><ul>"
+            for ex in examples:
+                list_html += f"<li>{ex}</li>"
+            list_html += "</ul>"
+            
+            # Escaping
+            list_html_js = list_html.replace("'", "\\'").replace("\n", "")
+            
+            js = f"""
+            var div = document.getElementById('other-examples');
+            if (div) {{
+                div.innerHTML = '{list_html_js}';
+            }}
+            """
+            mw.reviewer.web.eval(js)
+        else:
+            js = "var div = document.getElementById('other-examples'); if(div) { div.innerHTML = 'No other examples found.'; }"
+            mw.reviewer.web.eval(js)
+
+    except Exception as e:
+        print(f"Error in Eitango addon: {str(e)}")
+
     for nid in found_nids:
         other_note = mw.col.get_note(nid)
         
