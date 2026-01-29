@@ -2,34 +2,35 @@ from aqt import mw
 from aqt.utils import showInfo, tooltip
 from aqt.qt import *
 from aqt import gui_hooks
+from anki.notes import Note
 from datetime import datetime
 import re
 
 # 定数
 MODEL_NAME = "Eitango"
-CONF_NAME = "Eitango Addon"
+CACHE_FIELD = "ExamplesCache"
 
 # -------------------------------------------------------------------------
-# 1. ノートタイプの作成 (初回起動時のみ)
+# 1. ノートタイプの作成・更新
 # -------------------------------------------------------------------------
 def create_model_if_needed():
     col = mw.col
     model = col.models.byName(MODEL_NAME)
     
     if not model:
-        # Cloze(穴埋め)タイプとして作成
+        # モデル新規作成
         model = col.models.new(MODEL_NAME)
         model['type'] = 1 # 1 = Cloze
         
-        # フィールドの定義
-        # IDを先頭にすることで、同じ単語(Word)でも登録できるようにする
-        fields = ["ID", "Word", "Meaning", "Sentence"]
+        # フィールド定義
+        # ExamplesCache: モバイル用にHTMLを事前に計算して保存しておくフィールド
+        fields = ["ID", "Word", "Meaning", "Sentence", "Note", CACHE_FIELD]
         for f in fields:
             col.models.addField(model, col.models.newField(f))
             
-        # テンプレート(カードデザイン)の定義
+        # テンプレート
         t = col.models.newTemplate("Eitango Card")
-        t['qfmt'] = "{{cloze:Sentence}}" # 表面: 穴埋め問題
+        t['qfmt'] = "{{cloze:Sentence}}"
         t['afmt'] = """
 {{Word}}
 <div>
@@ -37,27 +38,32 @@ def create_model_if_needed():
 <hr>
 {{cloze:Sentence}}
 </div>
+<div>
+{{Note}}
+</div>
 <br>
-<div id='other-examples' style='text-align: left; font-size: 16px;'></div>
+{{ExamplesCache}}
 """
         col.models.addTemplate(model, t)
         
-        # CSSの設定
+        # CSS
         model['css'] = """
 .card {
  font-family: arial;
  font-size: 20px;
- text-align: center;
+ text-align: left;
  color: black;
  background-color: white;
 }
 .cloze {
  font-weight: bold;
- color: blue;
+ color: teal;
 }
 .nightMode .cloze {
- color: lightblue;
+ color: teal;
 }
+
+/* 表のスタイル */
 .example-table {
  width: 100%;
  border-collapse: collapse;
@@ -83,10 +89,15 @@ def create_model_if_needed():
 }
 """
         col.models.add(model)
-        print(f"モデル '{MODEL_NAME}' を作成しました。")
     else:
-        # 既存モデルがある場合のフィールド確認などは今回は省略
-        pass
+        # 既存モデルへのフィールド追加（マイグレーション）
+        flds = [f['name'] for f in model['flds']]
+        if CACHE_FIELD not in flds:
+            f = col.models.newField(CACHE_FIELD)
+            col.models.addField(model, f)
+            # テンプレートも更新が必要だが、ユーザーがカスタマイズしている可能性があるため
+            # ここではフィールド追加のみ行う。テンプレート変更はユーザーに案内するか、強制的更新が必要。
+            # 今回は簡易的に、フィールドだけ足しておく。
 
 # -------------------------------------------------------------------------
 # 2. IDの自動入力
@@ -98,117 +109,214 @@ def setup_id(editor):
     
     # IDフィールド(0番目)が空ならセット
     if not note.fields[0]:
-        # YYYYMMDDHHMMSS 形式 (例: 20260129183500)
         note.fields[0] = datetime.now().strftime("%Y%m%d%H%M%S")
         editor.loadNote()
 
 # -------------------------------------------------------------------------
-# 3. 答え表示時に他の例文を表示
+# 3. キャッシュ更新ロジック (モバイル対応の中核)
 # -------------------------------------------------------------------------
-def on_show_answer(card):
-    # 現在のカードが Eitango モデルか確認
-    note = card.note()
-    if note.model()['name'] != MODEL_NAME:
-        return
-    
-    word_field = note['Word']
-    current_id = note['ID']
-    
-    if not word_field:
-        return
+_is_updating = False
 
+def update_cache_for_word(word):
+    """
+    指定された単語を持つ全てのEitangoノートを検索し、
+    ExamplesCacheフィールドを一括更新する。
+    """
+    global _is_updating
+    if _is_updating: return # 無限ループ防止
+    
+    if not word: return
+
+    col = mw.col
+    
+    # 同じ単語を持つノートを全て取得
+    # 注意: エスケープ処理は簡易版
+    query = f'"note:{MODEL_NAME}" "Word:{word}"'
+    nids = col.find_notes(query)
+    
+    if not nids: return
+
+    # ノートオブジェクトを全て取得
+    notes = [col.get_note(nid) for nid in nids]
+    
+    # データ収集
+    # {nid: {'text': sentence, 'date': date, 'reps': reps}}
+    note_data = {}
+    
+    for note in notes:
+        raw_sentence = note['Sentence']
+        if not raw_sentence: continue
+        
+        # 穴埋めタグ除去
+        clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+        
+        # 作成日
+        created_ts = note.id / 1000
+        date_str = datetime.fromtimestamp(created_ts).strftime("%Y/%m/%d")
+        
+        # Reps
+        total_reps = 0
+        for c in note.cards():
+            total_reps += c.reps
+            
+        note_data[note.id] = {
+            'text': clean_sentence,
+            'date': date_str,
+            'reps': total_reps
+        }
+        
+    # 各ノートのキャッシュフィールドを更新して保存
+    _is_updating = True
     try:
-        # 1. カンマで単語を分割
-        words = [w.strip() for w in word_field.split(',') if w.strip()]
-        
-        if not words:
-            return
+        for target_note in notes:
+            # 自分以外を表示するリストを作成
+            examples = []
+            seen_texts = set()
             
-        # 2. 検索クエリの構築
-        # note:Eitango ("Word:*word1*" OR "Word:*word2*")
-        # ワイルドカード(*)を使うことで、フィールドの一部にその単語が含まれていればヒットする
-        or_conditions = " OR ".join([f'"Word:*{w}*"' for w in words])
-        query = f'"note:{MODEL_NAME}" ({or_conditions})'
-        
-        found_nids = mw.col.find_notes(query)
-        
-        examples = []
-        for nid in found_nids:
-            # 自分自身は除外 (内部IDで比較するのが確実)
-            if nid == note.id:
-                continue
-
-            other_note = mw.col.get_note(nid)
-            
-            # IDフィールドによる重複チェック(念のため)
-            if other_note['ID'] == current_id:
-                continue
-
-            raw_sentence = other_note['Sentence']
-            if not raw_sentence:
-                continue
+            for nid, data in note_data.items():
+                if nid == target_note.id: continue # 自分は除外
                 
-            # 穴埋めタグの除去
-            clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+                # 重複チェック (同文なら除外)
+                if data['text'] in seen_texts: continue
+                seen_texts.add(data['text'])
+                
+                examples.append(data)
             
-            # -------------------------------------------------
-            # Ankiのシステムデータから情報を取得
-            # -------------------------------------------------
+            # HTML生成
+            if examples:
+                html = "<table class='example-table'>"
+                html += "<tr><th>Sentence</th><th>Date</th><th>Reps</th></tr>"
+                for ex in examples:
+                    html += f"<tr><td>{ex['text']}</td><td>{ex['date']}</td><td>{ex['reps']}</td></tr>"
+                html += "</table>"
+            else:
+                html = "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
             
-            # 1. 作成日時 (note.id は作成時のミリ秒タイムスタンプ)
-            created_ts = other_note.id / 1000
-            dt = datetime.fromtimestamp(created_ts)
-            date_str = dt.strftime("%Y/%m/%d") # シンプルに日付だけにする（時刻は煩雑かも）
-            
-            # 2. 学習回数 (カード情報から取得)
-            # ノートに紐づくカードを全て取得 (通常は1つだが、Clozeは複数ありうる)
-            cards = other_note.cards()
-            total_reps = 0
-            if cards:
-                # 例文として表示しているノートの総学習回数（カードごとの合計）
-                for c in cards:
-                    total_reps += c.reps
+            # 変更がある場合のみ保存（無駄な書き込み防止）
+            if target_note[CACHE_FIELD] != html:
+                target_note[CACHE_FIELD] = html
+                col.update_note(target_note) # ここで保存！
+                
+    finally:
+        _is_updating = False
 
-            # 表示用文字列
-            info_str = f" <span style='font-size: 0.8em; color: gray;'>({date_str}, {total_reps} reps)</span>"
-            
-            # 重複排除: 文章だけで判断するか、情報込みで判断するか
-            # ここでは「文章自体」が同じなら表示しないようにする（シンプル化）
-            # もし日付違いの同文を表示したい場合は full_text でチェックする
-            full_text = clean_sentence + info_str
-            
-            # 既存のリストに同じ内容が含まれていないか確認
-            if not any(ex['text'] == clean_sentence for ex in examples):
-                examples.append({
-                    'text': clean_sentence,
-                    'date': date_str,
-                    'reps': total_reps
-                })
+def on_editor_unfocus(changed, note, current_field_idx):
+    """
+    エディタでフィールドからフォーカスが外れたときに呼ばれる
+    """
+    if not changed: return
+    if note.model()['name'] != MODEL_NAME: return
+    
+    # 変更されたフィールドが「Word」かどうか確認
+    # note.fields は値のリストなので、インデックスで照合
+    # モデルのフィールドリストを取得
+    flds = [f['name'] for f in note.model()['flds']]
+    if current_field_idx < len(flds) and flds[current_field_idx] == "Word":
+        # Wordフィールドが変更されたので、キャッシュ更新を実行
+        word = note.fields[current_field_idx]
+        # 少し遅延させるか、そのまま実行するか。ここでは直接実行。
+        # 注意: update_cache_for_word内で col.update_note を呼ぶと
+        # エディタ上のノートと競合する可能性があるので、
+        # ターゲットが自分自身以外になるように気をつける必要がある。
+        update_cache_for_word(word)
+
+# -------------------------------------------------------------------------
+# 4. 手動更新アクション (デバッグ・一括更新用)
+# -------------------------------------------------------------------------
+def update_all_cache():
+    """
+    全てのEitangoノートのキャッシュを強制的に更新する
+    """
+    col = mw.col
+    # 全てのEitangoノートを取得
+    nids = col.find_notes(f'"note:{MODEL_NAME}"')
+    if not nids:
+        showInfo("Eitangoノートが見つかりませんでした。")
+        return
+
+    # 単語ごとにノートIDをグループ化
+    word_to_nids = {}
+    for nid in nids:
+        note = col.get_note(nid)
+        word = note['Word']
+        if not word: continue
         
-        if examples:
-            # HTMLテーブルを作成
-            list_html = "<strong>Other Examples:</strong><table class='example-table'>"
-            list_html += "<tr><th>Sentence</th><th>Date</th><th>Reps</th></tr>"
-            for ex in examples:
-                list_html += f"<tr><td>{ex['text']}</td><td>{ex['date']}</td><td>{ex['reps']}</td></tr>"
-            list_html += "</table>"
+        if word not in word_to_nids:
+            word_to_nids[word] = []
+        word_to_nids[word].append(nid)
+    
+    # プログレスバー（簡易）
+    mw.progress.start(immediate=True)
+    count = 0
+    total = len(word_to_nids)
+    
+    try:
+        for i, (word, target_nids) in enumerate(word_to_nids.items()):
+            mw.progress.update(label=f"Updating: {word}", value=i, max=total)
             
-            # エスケープ処理
-            list_html_js = list_html.replace("'", "\\'").replace("\n", "")
+            # この単語グループのデータを収集
+            group_data = []
+            for nid in target_nids:
+                note = col.get_note(nid)
+                raw_sentence = note['Sentence']
+                if not raw_sentence: continue
+                
+                # 穴埋め除去
+                clean = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+                
+                # 日付
+                ts = note.id / 1000
+                dt = datetime.fromtimestamp(ts).strftime("%Y/%m/%d")
+                
+                # Reps
+                reps = 0
+                for c in note.cards():
+                    reps += c.reps
+                
+                group_data.append({
+                    'nid': nid,
+                    'text': clean,
+                    'date': dt,
+                    'reps': reps
+                })
             
-            js = f"""
-            var div = document.getElementById('other-examples');
-            if (div) {{
-                div.innerHTML = '{list_html_js}';
-            }}
-            """
-            mw.reviewer.web.eval(js)
-        else:
-            js = "var div = document.getElementById('other-examples'); if(div) { div.innerHTML = 'No other examples found.'; }"
-            mw.reviewer.web.eval(js)
-
-    except Exception as e:
-        print(f"Error in Eitango addon: {str(e)}")
+            # 各ノートに書き込み
+            for nid in target_nids:
+                note = col.get_note(nid)
+                
+                # 自分以外をリスト化
+                examples = [d for d in group_data if d['nid'] != nid]
+                
+                # HTML生成
+                if examples:
+                    # 重複排除（テキスト単位）
+                    unique_ex = []
+                    seen = set()
+                    for ex in examples:
+                        if ex['text'] not in seen:
+                            seen.add(ex['text'])
+                            unique_ex.append(ex)
+                    
+                    if unique_ex:
+                        html = "<table class='example-table'>"
+                        html += "<tr><th>Sentence</th><th>Date</th><th>Reps</th></tr>"
+                        for ex in unique_ex:
+                            html += f"<tr><td>{ex['text']}</td><td>{ex['date']}</td><td>{ex['reps']}</td></tr>"
+                        html += "</table>"
+                    else:
+                         html = "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
+                else:
+                    html = "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
+                
+                if note[CACHE_FIELD] != html:
+                    note[CACHE_FIELD] = html
+                    col.update_note(note)
+                    count += 1
+                    
+    finally:
+        mw.progress.finish()
+        
+    showInfo(f"更新完了: {count} 件のノートを更新しました。")
 
 # -------------------------------------------------------------------------
 # 初期化処理
@@ -216,7 +324,12 @@ def on_show_answer(card):
 def init_addon():
     create_model_if_needed()
     gui_hooks.editor_did_load_note.append(setup_id)
-    gui_hooks.reviewer_did_show_answer.append(on_show_answer)
+    gui_hooks.editor_did_unfocus_field.append(on_editor_unfocus)
+    
+    # メニューに追加
+    action = QAction("Update Eitango Examples", mw)
+    qconnect(action.triggered, update_all_cache)
+    mw.form.menuTools.addAction(action)
 
 # Anki起動時に実行
 gui_hooks.profile_did_open.append(init_addon)
