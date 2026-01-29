@@ -86,6 +86,17 @@ def create_model_if_needed():
 .nightMode .example-table td {
  border-bottom: 1px solid #444;
 }
+/* クリック可能な行のスタイル */
+.example-table tr:not(:first-child) {
+ cursor: pointer;
+ transition: background-color 0.1s;
+}
+.example-table tr:not(:first-child):hover {
+ background-color: #e8f0fe;
+}
+.nightMode .example-table tr:not(:first-child):hover {
+ background-color: #444;
+}
 """
         col.models.add(model)
     else:
@@ -155,6 +166,7 @@ def get_examples_html(word, current_nid):
                 primary_due = min(dts) if dts else "New"
 
         group_data.append({
+            'nid': nid,
             'text': clean,
             'created': created_str,
             'reps': total_reps,
@@ -165,7 +177,9 @@ def get_examples_html(word, current_nid):
         html = "<table class='example-table'>"
         html += "<tr><th>Sentence</th><th>Created</th><th>Reps</th><th>Due</th></tr>"
         for d in group_data:
-            html += f"<tr><td>{d['text']}</td><td>{d['created']}</td><td>{d['reps']}</td><td>{d['due']}</td></tr>"
+            # クリックでブラウザを開くコマンド
+            onclick = f"onclick=\"pycmd('eitango_open:{d['nid']}');\""
+            html += f"<tr {onclick}><td>{d['text']}</td><td>{d['created']}</td><td>{d['reps']}</td><td>{d['due']}</td></tr>"
         html += "</table>"
         return html
     else:
@@ -235,10 +249,11 @@ def update_all_cache():
             for nid in group_nids:
                 note = col.get_note(nid)
                 html = get_examples_html(word, nid)
-                if note[CACHE_FIELD] != html:
-                    note[CACHE_FIELD] = html
-                    col.update_note(note)
-                    count += 1
+                
+                # 強制的に更新（onclick属性の追加などを反映させるため）
+                note[CACHE_FIELD] = html
+                col.update_note(note)
+                count += 1
     finally:
         mw.progress.finish()
         
@@ -256,4 +271,32 @@ def init_addon():
     qconnect(action.triggered, update_all_cache)
     mw.form.menuTools.addAction(action)
 
+# -------------------------------------------------------------------------
+# 5. クリックイベントのハンドリング
+# -------------------------------------------------------------------------
+def on_js_message(handled, message, context):
+    """
+    JSからのメッセージ (pycmd) を処理する
+    """
+    if not message.startswith("eitango_open:"):
+        return handled
+    
+    # "eitango_open:12345" -> "12345"
+    nid_str = message.split(":")[1]
+    
+    try:
+        import aqt # ここでインポート
+        nid = int(nid_str)
+        
+        # ブラウザを開いてそのノートを検索・表示
+        browser = aqt.dialogs.open("Browser", mw)
+        browser.search_for(f"nid:{nid}")
+        
+        return (True, None) # 処理済みであることを返す
+    except Exception as e:
+        tooltip(f"Error opening browser: {str(e)}")
+        return handled
+
+# Anki起動時に実行
+gui_hooks.webview_did_receive_js_message.append(on_js_message)
 gui_hooks.profile_did_open.append(init_addon)
