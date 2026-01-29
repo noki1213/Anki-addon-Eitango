@@ -1,8 +1,9 @@
 from aqt import mw
 from aqt.utils import showInfo, tooltip
 from aqt.qt import *
-from anki.hooks import addHook
-import time
+from aqt import gui_hooks
+from datetime import datetime
+import re
 
 # 定数
 MODEL_NAME = "Eitango"
@@ -35,7 +36,7 @@ def create_model_if_needed():
 <div style='font-size: 20px; font-weight: bold;'>{{Word}}</div>
 <div style='color: gray;'>{{Meaning}}</div>
 <br>
-<div id='other-examples'></div>
+<div id='other-examples' style='text-align: left; font-size: 16px;'></div>
 """
         col.models.addTemplate(model, t)
         
@@ -55,6 +56,12 @@ def create_model_if_needed():
 .nightMode .cloze {
  color: lightblue;
 }
+ul {
+ padding-left: 20px;
+}
+li {
+ margin-bottom: 5px;
+}
 """
         col.models.add(model)
         print(f"モデル '{MODEL_NAME}' を作成しました。")
@@ -65,29 +72,6 @@ def create_model_if_needed():
 # -------------------------------------------------------------------------
 # 2. IDの自動入力
 # -------------------------------------------------------------------------
-def on_editor_did_init(editor):
-    # エディタが開かれたときにIDフィールドが空なら埋める
-    # 注: 新規追加時を想定
-    note = editor.note
-    if note is None:
-        return
-        
-    if note.model()['name'] != MODEL_NAME:
-        return
-
-    # IDフィールド(index 0)が空ならタイムスタンプを入れる
-    if not note.fields[0]:
-        # ミリ秒単位のユニークID
-        unique_id = str(int(time.time() * 1000))
-        note.fields[0] = unique_id
-        editor.loadNote() # UIに反映
-
-# 追加画面が開くたびにフックするのではなく、
-# 新しいノートがセットされたタイミングなどでIDを振るのが安全
-# ここでは gui_hooks.editor_did_init_shortcuts を使うのが一般的だが
-# シンプルに editor_did_load_note を使う
-from aqt import gui_hooks
-
 def setup_id(editor):
     note = editor.note
     if not note: return
@@ -95,8 +79,71 @@ def setup_id(editor):
     
     # IDフィールド(0番目)が空ならセット
     if not note.fields[0]:
-        note.fields[0] = str(int(time.time() * 1000))
+        # YYYYMMDDHHMMSS 形式 (例: 20260129183500)
+        note.fields[0] = datetime.now().strftime("%Y%m%d%H%M%S")
         editor.loadNote()
+
+# -------------------------------------------------------------------------
+# 3. 答え表示時に他の例文を表示
+# -------------------------------------------------------------------------
+def on_show_answer(card):
+    # 現在のカードが Eitango モデルか確認
+    note = card.note()
+    if note.model()['name'] != MODEL_NAME:
+        return
+    
+    word = note['Word']
+    current_id = note['ID']
+    
+    if not word:
+        return
+
+    # 同じ単語を持つ他のノートを検索
+    # note:Eitango "Word:xxxxx"
+    # エスケープ処理: ダブルクォートがある場合はシングルクォートで囲むなどの配慮が必要だが
+    # ここでは簡易的に処理
+    query = f'"note:{MODEL_NAME}" "Word:{word}"'
+    found_nids = mw.col.find_notes(query)
+    
+    examples = []
+    for nid in found_nids:
+        other_note = mw.col.get_note(nid)
+        
+        # 自分自身は除外
+        if other_note['ID'] == current_id:
+            continue
+            
+        raw_sentence = other_note['Sentence']
+        if not raw_sentence:
+            continue
+            
+        # 穴埋めタグの除去: {{c1::答え::ヒント}} -> 答え
+        # 簡易的な正規表現
+        clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+        examples.append(clean_sentence)
+    
+    if examples:
+        # HTMLリストを作成
+        list_html = "<strong>Other Examples:</strong><ul>"
+        for ex in examples:
+            list_html += f"<li>{ex}</li>"
+        list_html += "</ul>"
+        
+        # エスケープ処理 (JavaScriptの文字列として安全にする)
+        list_html_js = list_html.replace("'", "\\'").replace("\n", "")
+        
+        # JavaScriptを実行してDOMを書き換え
+        js = f"""
+        var div = document.getElementById('other-examples');
+        if (div) {{
+            div.innerHTML = '{list_html_js}';
+        }}
+        """
+        mw.reviewer.web.eval(js)
+    else:
+        # 例文がない場合
+        js = "var div = document.getElementById('other-examples'); if(div) { div.innerHTML = 'No other examples found.'; }"
+        mw.reviewer.web.eval(js)
 
 # -------------------------------------------------------------------------
 # 初期化処理
@@ -104,7 +151,7 @@ def setup_id(editor):
 def init_addon():
     create_model_if_needed()
     gui_hooks.editor_did_load_note.append(setup_id)
+    gui_hooks.reviewer_did_show_answer.append(on_show_answer)
 
 # Anki起動時に実行
-from aqt import gui_hooks
 gui_hooks.profile_did_open.append(init_addon)
