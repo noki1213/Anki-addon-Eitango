@@ -31,10 +31,12 @@ def create_model_if_needed():
         t = col.models.newTemplate("Eitango Card")
         t['qfmt'] = "{{cloze:Sentence}}" # 表面: 穴埋め問題
         t['afmt'] = """
-{{cloze:Sentence}}
+{{Word}}
+<div>
+{{Meaning}}
 <hr>
-<div style='font-size: 20px; font-weight: bold;'>{{Word}}</div>
-<div style='color: gray;'>{{Meaning}}</div>
+{{cloze:Sentence}}
+</div>
 <br>
 <div id='other-examples' style='text-align: left; font-size: 16px;'></div>
 """
@@ -56,11 +58,28 @@ def create_model_if_needed():
 .nightMode .cloze {
  color: lightblue;
 }
-ul {
- padding-left: 20px;
+.example-table {
+ width: 100%;
+ border-collapse: collapse;
+ margin-top: 20px;
+ font-size: 0.8em;
+ line-height: 1.5;
 }
-li {
- margin-bottom: 5px;
+.example-table th, .example-table td {
+ border-bottom: 1px solid #ccc;
+ padding: 12px 8px;
+ text-align: left;
+}
+.example-table th {
+ background-color: #f0f0f0;
+ color: #333;
+}
+.nightMode .example-table th {
+ background-color: #333;
+ color: #ccc;
+}
+.nightMode .example-table td {
+ border-bottom: 1px solid #444;
 }
 """
         col.models.add(model)
@@ -92,15 +111,25 @@ def on_show_answer(card):
     if note.model()['name'] != MODEL_NAME:
         return
     
-    word = note['Word']
+    word_field = note['Word']
     current_id = note['ID']
     
-    if not word:
+    if not word_field:
         return
 
     try:
-        # 同じ単語を持つ他のノートを検索
-        query = f'"note:{MODEL_NAME}" "Word:{word}"'
+        # 1. カンマで単語を分割
+        words = [w.strip() for w in word_field.split(',') if w.strip()]
+        
+        if not words:
+            return
+            
+        # 2. 検索クエリの構築
+        # note:Eitango ("Word:*word1*" OR "Word:*word2*")
+        # ワイルドカード(*)を使うことで、フィールドの一部にその単語が含まれていればヒットする
+        or_conditions = " OR ".join([f'"Word:*{w}*"' for w in words])
+        query = f'"note:{MODEL_NAME}" ({or_conditions})'
+        
         found_nids = mw.col.find_notes(query)
         
         examples = []
@@ -149,15 +178,20 @@ def on_show_answer(card):
             full_text = clean_sentence + info_str
             
             # 既存のリストに同じ内容が含まれていないか確認
-            if not any(clean_sentence in ex for ex in examples):
-                examples.append(full_text)
+            if not any(ex['text'] == clean_sentence for ex in examples):
+                examples.append({
+                    'text': clean_sentence,
+                    'date': date_str,
+                    'reps': total_reps
+                })
         
         if examples:
-            # HTMLリストを作成
-            list_html = "<strong>Other Examples:</strong><ul>"
+            # HTMLテーブルを作成
+            list_html = "<strong>Other Examples:</strong><table class='example-table'>"
+            list_html += "<tr><th>Sentence</th><th>Date</th><th>Reps</th></tr>"
             for ex in examples:
-                list_html += f"<li>{ex}</li>"
-            list_html += "</ul>"
+                list_html += f"<tr><td>{ex['text']}</td><td>{ex['date']}</td><td>{ex['reps']}</td></tr>"
+            list_html += "</table>"
             
             # エスケープ処理
             list_html_js = list_html.replace("'", "\\'").replace("\n", "")
