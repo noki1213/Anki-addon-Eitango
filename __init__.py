@@ -2,34 +2,35 @@ from aqt import mw
 from aqt.utils import showInfo, tooltip
 from aqt.qt import *
 from aqt import gui_hooks
+from anki.notes import Note
 from datetime import datetime
 import re
 
 # Constants
 MODEL_NAME = "Eitango"
-CONF_NAME = "Eitango Addon"
+CACHE_FIELD = "ExamplesCache"
 
 # -------------------------------------------------------------------------
-# 1. Create the note type (first launch only)
+# 1. Create/update the note type
 # -------------------------------------------------------------------------
 def create_model_if_needed():
     col = mw.col
     model = col.models.byName(MODEL_NAME)
     
     if not model:
-        # Create it as a Cloze (fill-in-the-blank) type
+        # Create a new model
         model = col.models.new(MODEL_NAME)
         model['type'] = 1 # 1 = Cloze
         
         # Field definitions
-        # Putting the ID first lets notes with the same Word still be added
-        fields = ["ID", "Word", "Meaning", "Sentence"]
+        # ExamplesCache: a field that pre-renders and stores the HTML for mobile
+        fields = ["ID", "Word", "Meaning", "Sentence", "Note", CACHE_FIELD]
         for f in fields:
             col.models.addField(model, col.models.newField(f))
             
-        # Define the templates (card design)
+        # Template
         t = col.models.newTemplate("Eitango Card")
-        t['qfmt'] = "{{cloze:Sentence}}" # 表面: 穴埋め問題
+        t['qfmt'] = "{{cloze:Sentence}}"
         t['afmt'] = """
 {{Word}}
 <div>
@@ -37,27 +38,32 @@ def create_model_if_needed():
 <hr>
 {{cloze:Sentence}}
 </div>
+<div>
+{{Note}}
+</div>
 <br>
-<div id='other-examples' style='text-align: left; font-size: 16px;'></div>
+{{ExamplesCache}}
 """
         col.models.addTemplate(model, t)
         
-        # CSS settings
+        # CSS
         model['css'] = """
 .card {
  font-family: arial;
  font-size: 20px;
- text-align: center;
+ text-align: left;
  color: black;
  background-color: white;
 }
 .cloze {
  font-weight: bold;
- color: blue;
+ color: teal;
 }
 .nightMode .cloze {
- color: lightblue;
+ color: teal;
 }
+
+/* Table style */
 .example-table {
  width: 100%;
  border-collapse: collapse;
@@ -83,10 +89,15 @@ def create_model_if_needed():
 }
 """
         col.models.add(model)
-        print(f"モデル '{MODEL_NAME}' を作成しました。")
     else:
-        # Skipping field checks against an existing model for now
-        pass
+        # Add a field to the existing model (migration)
+        flds = [f['name'] for f in model['flds']]
+        if CACHE_FIELD not in flds:
+            f = col.models.newField(CACHE_FIELD)
+            col.models.addField(model, f)
+            # The templates need updating too, but since the user may have customized them,
+            # Only the field is added here. Template changes need to either be surfaced to the user or forced through.
+            # For now, just add the field and leave it at that.
 
 # -------------------------------------------------------------------------
 # 2. Auto-fill the ID
@@ -98,117 +109,214 @@ def setup_id(editor):
     
     # Set the ID field (index 0) if it's empty
     if not note.fields[0]:
-        # YYYYMMDDHHMMSS format (e.g. 20260129183500)
         note.fields[0] = datetime.now().strftime("%Y%m%d%H%M%S")
         editor.loadNote()
 
 # -------------------------------------------------------------------------
-# 3. Show the other example sentences when the answer is revealed
+# 3. Cache update logic (the core of mobile support)
 # -------------------------------------------------------------------------
-def on_show_answer(card):
-    # Check whether the current card is an Eitango model
-    note = card.note()
-    if note.model()['name'] != MODEL_NAME:
-        return
-    
-    word_field = note['Word']
-    current_id = note['ID']
-    
-    if not word_field:
-        return
+_is_updating = False
 
+def update_cache_for_word(word):
+    """
+    指定された単語を持つ全てのEitangoノートを検索し、
+    ExamplesCacheフィールドを一括更新する。
+    """
+    global _is_updating
+    if _is_updating: return # 無限ループ防止
+    
+    if not word: return
+
+    col = mw.col
+    
+    # Fetch all notes that share the same word
+    # Note: this escaping is a simplified version
+    query = f'"note:{MODEL_NAME}" "Word:{word}"'
+    nids = col.find_notes(query)
+    
+    if not nids: return
+
+    # Fetch all the note objects
+    notes = [col.get_note(nid) for nid in nids]
+    
+    # Data collection
+    # {nid: {'text': sentence, 'date': date, 'reps': reps}}
+    note_data = {}
+    
+    for note in notes:
+        raw_sentence = note['Sentence']
+        if not raw_sentence: continue
+        
+        # Strip cloze-deletion tags
+        clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+        
+        # Creation date
+        created_ts = note.id / 1000
+        date_str = datetime.fromtimestamp(created_ts).strftime("%Y/%m/%d")
+        
+        # Reps
+        total_reps = 0
+        for c in note.cards():
+            total_reps += c.reps
+            
+        note_data[note.id] = {
+            'text': clean_sentence,
+            'date': date_str,
+            'reps': total_reps
+        }
+        
+    # Update and save the cache field on each note
+    _is_updating = True
     try:
-        # 1. Split the words on commas
-        words = [w.strip() for w in word_field.split(',') if w.strip()]
-        
-        if not words:
-            return
+        for target_note in notes:
+            # Build a list to display everything except itself
+            examples = []
+            seen_texts = set()
             
-        # 2. Build the search query
-        # note:Eitango ("Word:*word1*" OR "Word:*word2*")
-        # Using a wildcard (*) so it matches whenever any part of a field contains the word
-        or_conditions = " OR ".join([f'"Word:*{w}*"' for w in words])
-        query = f'"note:{MODEL_NAME}" ({or_conditions})'
-        
-        found_nids = mw.col.find_notes(query)
-        
-        examples = []
-        for nid in found_nids:
-            # Exclude itself (comparing by internal ID is the reliable way)
-            if nid == note.id:
-                continue
-
-            other_note = mw.col.get_note(nid)
-            
-            # Check for duplicates via the ID field (just to be safe)
-            if other_note['ID'] == current_id:
-                continue
-
-            raw_sentence = other_note['Sentence']
-            if not raw_sentence:
-                continue
+            for nid, data in note_data.items():
+                if nid == target_note.id: continue # 自分は除外
                 
-            # Strip the cloze-deletion tags
-            clean_sentence = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+                # Check for duplicates (exclude if it's the same sentence)
+                if data['text'] in seen_texts: continue
+                seen_texts.add(data['text'])
+                
+                examples.append(data)
             
-            # -------------------------------------------------
-            # Get info from Anki's system data
-            # -------------------------------------------------
+            # Generate the HTML
+            if examples:
+                html = "<table class='example-table'>"
+                html += "<tr><th>Sentence</th><th>Date</th><th>Reps</th></tr>"
+                for ex in examples:
+                    html += f"<tr><td>{ex['text']}</td><td>{ex['date']}</td><td>{ex['reps']}</td></tr>"
+                html += "</table>"
+            else:
+                html = "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
             
-            # 1. Creation timestamp (note.id is the millisecond timestamp from when it was created)
-            created_ts = other_note.id / 1000
-            dt = datetime.fromtimestamp(created_ts)
-            date_str = dt.strftime("%Y/%m/%d") # シンプルに日付だけにする（時刻は煩雑かも）
-            
-            # 2. Review count (pulled from the card info)
-            # Fetch all cards linked to the note (usually just one, but Cloze notes can have several)
-            cards = other_note.cards()
-            total_reps = 0
-            if cards:
-                # Total review count across the notes shown as example sentences (summed per card)
-                for c in cards:
-                    total_reps += c.reps
+            # Only save when something actually changed (avoids pointless writes)
+            if target_note[CACHE_FIELD] != html:
+                target_note[CACHE_FIELD] = html
+                col.update_note(target_note) # ここで保存！
+                
+    finally:
+        _is_updating = False
 
-            # String used for display
-            info_str = f" <span style='font-size: 0.8em; color: gray;'>({date_str}, {total_reps} reps)</span>"
-            
-            # De-duplication: judge by the sentence alone, or by the sentence plus its extra info
-            # Here we just skip displaying it when the sentence itself matches (kept simple)
-            # If we ever want to also show identical sentences from a different date, check full_text instead
-            full_text = clean_sentence + info_str
-            
-            # Check whether the existing list already has this content
-            if not any(ex['text'] == clean_sentence for ex in examples):
-                examples.append({
-                    'text': clean_sentence,
-                    'date': date_str,
-                    'reps': total_reps
-                })
+def on_editor_unfocus(changed, note, current_field_idx):
+    """
+    エディタでフィールドからフォーカスが外れたときに呼ばれる
+    """
+    if not changed: return
+    if note.model()['name'] != MODEL_NAME: return
+    
+    # Check whether the field that changed was "Word"
+    # note.fields is just a list of values, so match by index
+    # Get the model's field list
+    flds = [f['name'] for f in note.model()['flds']]
+    if current_field_idx < len(flds) and flds[current_field_idx] == "Word":
+        # The Word field changed, so run the cache update
+        word = note.fields[current_field_idx]
+        # Whether to delay this slightly or just run it right away — here we run it directly.
+        # Note: calling col.update_note inside update_cache_for_word
+        # This could conflict with the note currently open in the editor, so
+        # Need to make sure the target is never the note itself.
+        update_cache_for_word(word)
+
+# -------------------------------------------------------------------------
+# 4. Manual update action (for debugging and bulk updates)
+# -------------------------------------------------------------------------
+def update_all_cache():
+    """
+    全てのEitangoノートのキャッシュを強制的に更新する
+    """
+    col = mw.col
+    # Fetch all Eitango notes
+    nids = col.find_notes(f'"note:{MODEL_NAME}"')
+    if not nids:
+        showInfo("Eitangoノートが見つかりませんでした。")
+        return
+
+    # Group note IDs by word
+    word_to_nids = {}
+    for nid in nids:
+        note = col.get_note(nid)
+        word = note['Word']
+        if not word: continue
         
-        if examples:
-            # Build the HTML table
-            list_html = "<strong>Other Examples:</strong><table class='example-table'>"
-            list_html += "<tr><th>Sentence</th><th>Date</th><th>Reps</th></tr>"
-            for ex in examples:
-                list_html += f"<tr><td>{ex['text']}</td><td>{ex['date']}</td><td>{ex['reps']}</td></tr>"
-            list_html += "</table>"
+        if word not in word_to_nids:
+            word_to_nids[word] = []
+        word_to_nids[word].append(nid)
+    
+    # Progress bar (simple)
+    mw.progress.start(immediate=True)
+    count = 0
+    total = len(word_to_nids)
+    
+    try:
+        for i, (word, target_nids) in enumerate(word_to_nids.items()):
+            mw.progress.update(label=f"Updating: {word}", value=i, max=total)
             
-            # Escaping
-            list_html_js = list_html.replace("'", "\\'").replace("\n", "")
+            # Collect the data for this word's group
+            group_data = []
+            for nid in target_nids:
+                note = col.get_note(nid)
+                raw_sentence = note['Sentence']
+                if not raw_sentence: continue
+                
+                # Strip the cloze deletion
+                clean = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
+                
+                # Date
+                ts = note.id / 1000
+                dt = datetime.fromtimestamp(ts).strftime("%Y/%m/%d")
+                
+                # Reps
+                reps = 0
+                for c in note.cards():
+                    reps += c.reps
+                
+                group_data.append({
+                    'nid': nid,
+                    'text': clean,
+                    'date': dt,
+                    'reps': reps
+                })
             
-            js = f"""
-            var div = document.getElementById('other-examples');
-            if (div) {{
-                div.innerHTML = '{list_html_js}';
-            }}
-            """
-            mw.reviewer.web.eval(js)
-        else:
-            js = "var div = document.getElementById('other-examples'); if(div) { div.innerHTML = 'No other examples found.'; }"
-            mw.reviewer.web.eval(js)
-
-    except Exception as e:
-        print(f"Error in Eitango addon: {str(e)}")
+            # Write to each note
+            for nid in target_nids:
+                note = col.get_note(nid)
+                
+                # List everything except itself
+                examples = [d for d in group_data if d['nid'] != nid]
+                
+                # Generate the HTML
+                if examples:
+                    # De-duplicate (by text)
+                    unique_ex = []
+                    seen = set()
+                    for ex in examples:
+                        if ex['text'] not in seen:
+                            seen.add(ex['text'])
+                            unique_ex.append(ex)
+                    
+                    if unique_ex:
+                        html = "<table class='example-table'>"
+                        html += "<tr><th>Sentence</th><th>Date</th><th>Reps</th></tr>"
+                        for ex in unique_ex:
+                            html += f"<tr><td>{ex['text']}</td><td>{ex['date']}</td><td>{ex['reps']}</td></tr>"
+                        html += "</table>"
+                    else:
+                         html = "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
+                else:
+                    html = "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
+                
+                if note[CACHE_FIELD] != html:
+                    note[CACHE_FIELD] = html
+                    col.update_note(note)
+                    count += 1
+                    
+    finally:
+        mw.progress.finish()
+        
+    showInfo(f"更新完了: {count} 件のノートを更新しました。")
 
 # -------------------------------------------------------------------------
 # Initialization
@@ -216,7 +324,12 @@ def on_show_answer(card):
 def init_addon():
     create_model_if_needed()
     gui_hooks.editor_did_load_note.append(setup_id)
-    gui_hooks.reviewer_did_show_answer.append(on_show_answer)
+    gui_hooks.editor_did_unfocus_field.append(on_editor_unfocus)
+    
+    # Add to the menu
+    action = QAction("Update Eitango Examples", mw)
+    qconnect(action.triggered, update_all_cache)
+    mw.form.menuTools.addAction(action)
 
 # Run when Anki starts
 gui_hooks.profile_did_open.append(init_addon)
