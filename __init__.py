@@ -14,28 +14,28 @@ CACHE_FIELD = "ExamplesCache"
 # 1. ノートタイプの作成・更新
 # -------------------------------------------------------------------------
 def create_model_if_needed():
-    col = mw.col
-    model = col.models.byName(MODEL_NAME)
-    
-    if not model:
-        # モデル新規作成
-        model = col.models.new(MODEL_NAME)
-        model['type'] = 1 # 1 = Cloze
-        
-        # フィールド定義
-        fields = ["ID", "Word", "Meaning", "Sentence", "Note", CACHE_FIELD]
-        for f in fields:
-            col.models.addField(model, col.models.newField(f))
-            
-        # テンプレート
-        t = col.models.newTemplate("Eitango Card")
-        t['qfmt'] = "{{cloze:Sentence}}"
-        t['afmt'] = """
-{{Word}}
+	col = mw.col
+	model = col.models.byName(MODEL_NAME)
+
+	if not model:
+		# モデル新規作成
+		model = col.models.new(MODEL_NAME)
+		model['type'] = 1 # 1 = Cloze
+
+		# フィールド定義
+		fields = ["Head", "Usage", "Phrase", "Note", CACHE_FIELD]
+		for f in fields:
+			col.models.addField(model, col.models.newField(f))
+
+		# テンプレート
+		t = col.models.newTemplate("Eitango Card")
+		t['qfmt'] = "{{cloze:Phrase}}"
+		t['afmt'] = """
+{{Head}}
 <div>
-{{Meaning}}
+{{Usage}}
 <hr>
-{{cloze:Sentence}}
+{{cloze:Phrase}}
 </div>
 <div>
 {{Note}}
@@ -43,10 +43,10 @@ def create_model_if_needed():
 <br>
 {{ExamplesCache}}
 """
-        col.models.addTemplate(model, t)
-        
-        # CSS
-        model['css'] = """
+		col.models.addTemplate(model, t)
+
+		# CSS
+		model['css'] = """
 .card {
  font-family: arial;
  font-size: 20px;
@@ -98,204 +98,193 @@ def create_model_if_needed():
  background-color: #444;
 }
 """
-        col.models.add(model)
-    else:
-        # 既存モデルへのフィールド追加（マイグレーション）
-        flds = [f['name'] for f in model['flds']]
-        if CACHE_FIELD not in flds:
-            f = col.models.newField(CACHE_FIELD)
-            col.models.addField(model, f)
+		col.models.add(model)
+	else:
+		# 既存モデルへのフィールド追加（ExamplesCacheがない場合のみ）
+		flds = [f['name'] for f in model['flds']]
+		if CACHE_FIELD not in flds:
+			f = col.models.newField(CACHE_FIELD)
+			col.models.addField(model, f)
 
 # -------------------------------------------------------------------------
-# 2. 共通ロジック: 他の例文データの収集とHTML生成
+# 2. 共通ロジック: 複数Headの解析、他の例文データ収集とHTML生成
 # -------------------------------------------------------------------------
-def get_examples_html(word, current_nid):
-    """
-    指定された単語を持つ他のノートから情報を集め、HTMLテーブルを生成する
-    """
-    col = mw.col
-    query = f'"note:{MODEL_NAME}" "Word:{word}"'
-    nids = col.find_notes(query)
-    
-    if not nids:
-        return "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
+def parse_words(head_field):
+	"""
+	Headフィールドをカンマ区切りで分割し、単語リストを返す
+	例: "tell, inform" -> ["tell", "inform"]
+	"""
+	if not head_field:
+		return []
+	return [w.strip() for w in head_field.split(',') if w.strip()]
 
-    group_data = []
-    seen_texts = set()
+def get_examples_html(words, current_nid):
+	"""
+	指定された単語リストのいずれかを含む他のノートから情報を集め、HTMLテーブルを生成する
+	words: list of str（Headフィールドをカンマ分割したリスト）
+	"""
+	if not words:
+		return "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
 
-    for nid in nids:
-        if nid == current_nid:
-            continue
-            
-        note = col.get_note(nid)
-        raw_sentence = note['Sentence']
-        if not raw_sentence: continue
-        
-        # 穴埋めタグ除去
-        clean = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_sentence)
-        
-        # 重複排除
-        if clean in seen_texts: continue
-        seen_texts.add(clean)
-        
-        # 1. Created (作成日)
-        ts = note.id / 1000
-        created_str = datetime.fromtimestamp(ts).strftime("%Y/%m/%d")
-        
-        # 2. Reps (学習回数) & Due (期限)
-        total_reps = 0
-        due_dates = []
-        
-        for c in note.cards():
-            total_reps += c.reps
-            if c.type == 0: due_dates.append("New")
-            elif c.type in (1, 3): due_dates.append("Learning")
-            elif c.type == 2:
-                days_diff = c.due - mw.col.sched.today
-                if days_diff <= 0: due_dates.append("Due")
-                else:
-                    due_dt = datetime.now() + timedelta(days=days_diff)
-                    due_dates.append(due_dt.strftime("%Y/%m/%d"))
-        
-        primary_due = "None"
-        if due_dates:
-            if "Due" in due_dates: primary_due = "Due"
-            elif "Learning" in due_dates: primary_due = "Learning"
-            else:
-                dts = [d for d in due_dates if d not in ("New", "Learning", "Due")]
-                primary_due = min(dts) if dts else "New"
+	col = mw.col
+	# 全Eitangoノートを取得してPython側で一致を確認する
+	all_nids = col.find_notes(f'"note:{MODEL_NAME}"')
 
-        group_data.append({
-            'nid': nid,
-            'text': clean,
-            'created': created_str,
-            'reps': total_reps,
-            'due': primary_due
-        })
+	# 大文字小文字を区別せずに比較
+	words_set = set(w.lower() for w in words)
 
-    if group_data:
-        html = "<table class='example-table'>"
-        html += "<tr><th>Sentence</th><th>Created</th><th>Reps</th><th>Due</th></tr>"
-        for d in group_data:
-            # クリックでブラウザを開くコマンド
-            onclick = f"onclick=\"pycmd('eitango_open:{d['nid']}');\""
-            html += f"<tr {onclick}><td>{d['text']}</td><td>{d['created']}</td><td>{d['reps']}</td><td>{d['due']}</td></tr>"
-        html += "</table>"
-        return html
-    else:
-        return "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
+	group_data = []
+	seen_texts = set()
+
+	for nid in all_nids:
+		if nid == current_nid:
+			continue
+
+		note = col.get_note(nid)
+		note_words = parse_words(note['Head'])
+		note_words_set = set(w.lower() for w in note_words)
+
+		# 共通するHeadがあるかチェック
+		if not (words_set & note_words_set):
+			continue
+
+		raw_phrase = note['Phrase']
+		if not raw_phrase:
+			continue
+
+		# 穴埋めタグ除去
+		clean = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_phrase)
+
+		# 重複排除
+		if clean in seen_texts:
+			continue
+		seen_texts.add(clean)
+
+		group_data.append({
+			'nid': nid,
+			'phrase': clean,
+			'usage': note['Usage'],
+		})
+
+	if group_data:
+		html = "<table class='example-table'>"
+		html += "<tr><th>Phrase</th><th>Usage</th></tr>"
+		for d in group_data:
+			# クリックでブラウザを開くコマンド
+			onclick = f"onclick=\"pycmd('eitango_open:{d['nid']}');\""
+			html += f"<tr {onclick}><td>{d['phrase']}</td><td>{d['usage']}</td></tr>"
+		html += "</table>"
+		return html
+	else:
+		return "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
 
 # -------------------------------------------------------------------------
 # 3. キャッシュ更新ロジック
 # -------------------------------------------------------------------------
 _is_updating = False
 
-def update_cache_for_word(word):
-    global _is_updating
-    if _is_updating or not word: return
-    
-    col = mw.col
-    query = f'"note:{MODEL_NAME}" "Word:{word}"'
-    nids = col.find_notes(query)
-    
-    _is_updating = True
-    try:
-        for nid in nids:
-            note = col.get_note(nid)
-            html = get_examples_html(word, nid)
-            if note[CACHE_FIELD] != html:
-                note[CACHE_FIELD] = html
-                col.update_note(note)
-    finally:
-        _is_updating = False
+def update_cache_for_words(words):
+	"""
+	指定された単語リストのいずれかを含む全ノートのキャッシュを更新する
+	"""
+	global _is_updating
+	if _is_updating or not words: return
 
-def setup_id(editor):
-    note = editor.note
-    if not note or note.model()['name'] != MODEL_NAME: return
-    if not note.fields[0]:
-        note.fields[0] = datetime.now().strftime("%Y%m%d%H%M%S")
-        editor.loadNote()
+	col = mw.col
+	all_nids = col.find_notes(f'"note:{MODEL_NAME}"')
+	words_set = set(w.lower() for w in words)
+
+	# 関連するノートを絞り込む
+	related_nids = []
+	for nid in all_nids:
+		note = col.get_note(nid)
+		note_words = parse_words(note['Head'])
+		note_words_set = set(w.lower() for w in note_words)
+		if words_set & note_words_set:
+			related_nids.append(nid)
+
+	_is_updating = True
+	try:
+		for nid in related_nids:
+			note = col.get_note(nid)
+			note_words = parse_words(note['Head'])
+			html = get_examples_html(note_words, nid)
+			if note[CACHE_FIELD] != html:
+				note[CACHE_FIELD] = html
+				col.update_note(note)
+	finally:
+		_is_updating = False
 
 def on_editor_unfocus(changed, note, current_field_idx):
-    if not changed or note.model()['name'] != MODEL_NAME: return
-    flds = [f['name'] for f in note.model()['flds']]
-    if current_field_idx < len(flds) and flds[current_field_idx] == "Word":
-        update_cache_for_word(note.fields[current_field_idx])
+	if not changed or note.model()['name'] != MODEL_NAME: return
+	flds = [f['name'] for f in note.model()['flds']]
+	if current_field_idx < len(flds) and flds[current_field_idx] == "Head":
+		words = parse_words(note.fields[current_field_idx])
+		update_cache_for_words(words)
 
 # -------------------------------------------------------------------------
 # 4. 手動更新アクション
 # -------------------------------------------------------------------------
 def update_all_cache():
-    col = mw.col
-    nids = col.find_notes(f'"note:{MODEL_NAME}"')
-    if not nids:
-        showInfo("Eitangoノートが見つかりませんでした。")
-        return
+	col = mw.col
+	nids = col.find_notes(f'"note:{MODEL_NAME}"')
+	if not nids:
+		showInfo("Eitangoノートが見つかりませんでした。")
+		return
 
-    # 単語ごとにノートを分類
-    word_map = {}
-    for nid in nids:
-        word = col.get_note(nid)['Word']
-        if word:
-            if word not in word_map: word_map[word] = []
-            word_map[word].append(nid)
-    
-    mw.progress.start(immediate=True)
-    count = 0
-    try:
-        total = len(word_map)
-        for i, (word, group_nids) in enumerate(word_map.items()):
-            mw.progress.update(label=f"Updating: {word}", value=i, max=total)
-            for nid in group_nids:
-                note = col.get_note(nid)
-                html = get_examples_html(word, nid)
-                
-                # 強制的に更新（onclick属性の追加などを反映させるため）
-                note[CACHE_FIELD] = html
-                col.update_note(note)
-                count += 1
-    finally:
-        mw.progress.finish()
-        
-    showInfo(f"更新完了: {count} 件のノートを更新しました。")
+	mw.progress.start(immediate=True)
+	count = 0
+	try:
+		total = len(nids)
+		for i, nid in enumerate(nids):
+			note = col.get_note(nid)
+			words = parse_words(note['Head'])
+			mw.progress.update(label=f"Updating: {note['Head']}", value=i, max=total)
+			html = get_examples_html(words, nid)
+			# 強制的に更新
+			note[CACHE_FIELD] = html
+			col.update_note(note)
+			count += 1
+	finally:
+		mw.progress.finish()
+
+	showInfo(f"更新完了: {count} 件のノートを更新しました。")
 
 # -------------------------------------------------------------------------
 # 初期化処理
 # -------------------------------------------------------------------------
 def init_addon():
-    create_model_if_needed()
-    gui_hooks.editor_did_load_note.append(setup_id)
-    gui_hooks.editor_did_unfocus_field.append(on_editor_unfocus)
-    
-    action = QAction("Update Eitango Examples", mw)
-    qconnect(action.triggered, update_all_cache)
-    mw.form.menuTools.addAction(action)
+	create_model_if_needed()
+	gui_hooks.editor_did_unfocus_field.append(on_editor_unfocus)
+
+	action = QAction("Update Eitango Examples", mw)
+	qconnect(action.triggered, update_all_cache)
+	mw.form.menuTools.addAction(action)
 
 # -------------------------------------------------------------------------
 # 5. クリックイベントのハンドリング
 # -------------------------------------------------------------------------
 def on_js_message(handled, message, context):
-    """
-    JSからのメッセージ (pycmd) を処理する
-    """
-    if not message.startswith("eitango_open:"):
-        return handled
-    
-    # "eitango_open:12345" -> "12345"
-    nid_str = message.split(":")[1]
-    
-    try:
-        import aqt # ここでインポート
-        nid = int(nid_str)
-        
-        # ブラウザを開いてそのノートを検索・表示
-        browser = aqt.dialogs.open("Browser", mw)
-        browser.search_for(f"nid:{nid}")
-        
-        return (True, None) # 処理済みであることを返す
-    except Exception as e:
-        tooltip(f"Error opening browser: {str(e)}")
-        return handled
+	"""
+	JSからのメッセージ (pycmd) を処理する
+	"""
+	if not message.startswith("eitango_open:"):
+		return handled
+
+	nid_str = message.split(":")[1]
+
+	try:
+		import aqt
+		nid = int(nid_str)
+
+		# ブラウザを開いてそのノートを検索・表示
+		browser = aqt.dialogs.open("Browser", mw)
+		browser.search_for(f"nid:{nid}")
+
+		return (True, None)
+	except Exception as e:
+		tooltip(f"Error opening browser: {str(e)}")
+		return handled
 
 # Anki起動時に実行
 gui_hooks.webview_did_receive_js_message.append(on_js_message)

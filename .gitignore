@@ -9,3 +9,6 @@ __pycache__/
 # Anki
 meta.json
 user_files/
+
+# Claude Code
+CLAUDE.md
