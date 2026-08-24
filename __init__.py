@@ -10,11 +10,11 @@ import re
 MODEL_NAME = "Eitango"
 CACHE_FIELD = "ExamplesCache"
 
-# CSS version (bump this on every change so Anki picks up the update)
+# CSS version. Bump this whenever the stylesheet changes so Anki picks it up.
 CSS_VERSION = "v5"
 
 CARD_CSS = """
-/* Base Card Style — shadowed box with a light background layout */
+/* Base card style: drop shadow over a tinted background */
 .card {
 	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 	font-size: 18px;
@@ -44,7 +44,7 @@ CARD_CSS = """
 	background-color: rgba(91, 193, 180, 0.15);
 }
 
-/* Shared field style (shadowed box with rounded corners) */
+/* Shared field style: rounded box with a shadow */
 .field {
 	margin-bottom: 12px;
 	padding: 12px 15px;
@@ -59,7 +59,7 @@ CARD_CSS = """
 	box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
 }
 
-/* Field header (label and audio button side by side) */
+/* Field header: label and audio button side by side */
 .field-header {
 	display: flex;
 	align-items: center;
@@ -76,7 +76,7 @@ CARD_CSS = """
 	margin-bottom: 8px;
 }
 
-/* No margin-bottom on the label inside the header */
+/* Labels inside a header carry no bottom margin */
 .field-header .field-label {
 	margin-bottom: 0;
 }
@@ -87,7 +87,7 @@ CARD_CSS = """
 	line-height: 1.6;
 }
 
-/* Make the Note field a bit smaller */
+/* The Note field is rendered slightly smaller */
 .note-field .field-content {
 	font-size: 0.92em;
 }
@@ -121,7 +121,7 @@ CARD_CSS = """
 .note-label     { color: #6b7280; }
 .nightMode .note-label { color: #9ca3af; }
 
-/* Image */
+/* Images */
 .image-box {
 	margin-top: 16px;
 	text-align: center;
@@ -271,7 +271,7 @@ CARD_BACK = """{{#Usage}}
 {{/ExamplesCache}}"""
 
 # -------------------------------------------------------------------------
-# 1. Create/update the note type
+# 1. Create or update the note type
 # -------------------------------------------------------------------------
 def create_model_if_needed():
 	col = mw.col
@@ -287,7 +287,7 @@ def create_model_if_needed():
 		for f in fields:
 			col.models.addField(model, col.models.newField(f))
 
-		# Template
+		# Templates
 		t = col.models.newTemplate("Eitango Card")
 		t['qfmt'] = "{{cloze:Phrase}}"
 		t['afmt'] = """
@@ -307,13 +307,13 @@ def create_model_if_needed():
 		model['css'] = CARD_CSS
 		col.models.add(model)
 	else:
-		# Add a field to the existing model (only if ExamplesCache is missing)
+		# Add the field to an existing model, but only when ExamplesCache is missing
 		flds = [f['name'] for f in model['flds']]
 		if CACHE_FIELD not in flds:
 			f = col.models.newField(CACHE_FIELD)
 			col.models.addField(model, f)
 
-		# Update the CSS/HTML templates if the CSS version is out of date
+		# Refresh the CSS and HTML templates when the stored version is out of date
 		if f"eitango-css-version: {CSS_VERSION}" not in model['css']:
 			model['css'] = CARD_CSS
 			tmpl = model['tmpls'][0]
@@ -322,12 +322,12 @@ def create_model_if_needed():
 			col.models.save(model)
 
 # -------------------------------------------------------------------------
-# 2. Shared logic: parse multiple Links, gather the other example-sentence data, and generate the HTML
+# 2. Shared logic: parse multiple links, gather related examples, build the HTML
 # -------------------------------------------------------------------------
 def parse_words(head_field):
 	"""
-	Linkフィールドをカンマ区切りで分割し、単語リストを返す
-	例: "tell, inform" -> ["tell", "inform"]
+	Split the Link field on commas and return the list of words.
+	Example: "tell, inform" -> ["tell", "inform"]
 	"""
 	if not head_field:
 		return []
@@ -335,8 +335,8 @@ def parse_words(head_field):
 
 def get_examples_html(words, current_nid):
 	"""
-	Linkワードごとにアコーディオンセクションを生成する。
-	各セクションは ▼ word (件数) のヘッダーで開閉できる。
+	Build one collapsible section per linked word.
+	Each section has a header of the form: word (count).
 	"""
 	if not words:
 		return "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
@@ -344,7 +344,7 @@ def get_examples_html(words, current_nid):
 	col = mw.col
 	all_nids = col.find_notes(f'"note:{MODEL_NAME}"')
 
-	# Group by word
+	# Group the notes by word
 	groups = {w: [] for w in words}
 	seen_per_word = {w: set() for w in words}
 
@@ -360,10 +360,10 @@ def get_examples_html(words, current_nid):
 		if not raw_phrase:
 			continue
 
-		# Strip cloze-deletion tags
+		# Strip the cloze markers
 		clean = re.sub(r'\{\{c\d+::(.*?)(::.*?)?\}\}', r'\1', raw_phrase)
 
-		# Add it to each word's group (de-duplicated)
+		# Add to the group for this word, skipping duplicates
 		for w in words:
 			if w.lower() in note_words_lower:
 				if clean not in seen_per_word[w]:
@@ -374,7 +374,7 @@ def get_examples_html(words, current_nid):
 						'usage': note['Usage'],
 					})
 
-	# Show a message if every group turns out empty
+	# Show a message when every group came out empty
 	if not any(groups[w] for w in words):
 		return "<div style='font-size:0.8em; color:gray;'>No other examples found.</div>"
 
@@ -397,13 +397,13 @@ def get_examples_html(words, current_nid):
 	return html
 
 # -------------------------------------------------------------------------
-# 3. Cache update logic
+# 3. Cache refresh
 # -------------------------------------------------------------------------
 _is_updating = False
 
 def update_cache_for_words(words):
 	"""
-	指定された単語リストのいずれかを含む全ノートのキャッシュを更新する
+	Refresh the cache of every note containing any of the given words.
 	"""
 	global _is_updating
 	if _is_updating or not words: return
@@ -412,7 +412,7 @@ def update_cache_for_words(words):
 	all_nids = col.find_notes(f'"note:{MODEL_NAME}"')
 	words_set = set(w.lower() for w in words)
 
-	# Narrow down to the related notes
+	# Narrow down to the notes that are affected
 	related_nids = []
 	for nid in all_nids:
 		note = col.get_note(nid)
@@ -441,13 +441,13 @@ def on_editor_unfocus(changed, note, current_field_idx):
 		update_cache_for_words(words)
 
 # -------------------------------------------------------------------------
-# 4. Manual update action
+# 4. Manual refresh action
 # -------------------------------------------------------------------------
 def update_all_cache():
 	col = mw.col
 	nids = col.find_notes(f'"note:{MODEL_NAME}"')
 	if not nids:
-		showInfo("Eitangoノートが見つかりませんでした。")
+		showInfo("No Eitango notes were found.")
 		return
 
 	mw.progress.start(immediate=True)
@@ -459,17 +459,17 @@ def update_all_cache():
 			words = parse_words(note['Link'])
 			mw.progress.update(label=f"Updating: {note['Link']}", value=i, max=total)
 			html = get_examples_html(words, nid)
-			# Force an update
+			# Force a refresh
 			note[CACHE_FIELD] = html
 			col.update_note(note)
 			count += 1
 	finally:
 		mw.progress.finish()
 
-	showInfo(f"更新完了: {count} 件のノートを更新しました。")
+	showInfo(f"Done. Refreshed {count} note(s).")
 
 # -------------------------------------------------------------------------
-# Initialization
+# Initialisation
 # -------------------------------------------------------------------------
 def init_addon():
 	create_model_if_needed()
@@ -480,11 +480,11 @@ def init_addon():
 	mw.form.menuTools.addAction(action)
 
 # -------------------------------------------------------------------------
-# 5. Handle click events
+# 5. Click event handling
 # -------------------------------------------------------------------------
 def on_js_message(handled, message, context):
 	"""
-	JSからのメッセージ (pycmd) を処理する
+	Handle a pycmd message sent from the card's JavaScript.
 	"""
 	if not message.startswith("eitango_open:"):
 		return handled
@@ -495,7 +495,7 @@ def on_js_message(handled, message, context):
 		import aqt
 		nid = int(nid_str)
 
-		# Open the Browser and search for/display that note
+		# Open the browser and show that note
 		browser = aqt.dialogs.open("Browser", mw)
 		browser.search_for(f"nid:{nid}")
 
@@ -504,6 +504,6 @@ def on_js_message(handled, message, context):
 		tooltip(f"Error opening browser: {str(e)}")
 		return handled
 
-# Run when Anki starts
+# Runs when Anki starts
 gui_hooks.webview_did_receive_js_message.append(on_js_message)
 gui_hooks.profile_did_open.append(init_addon)
